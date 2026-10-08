@@ -1,0 +1,482 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Particle galaxy background</title>
+<style>
+  html, body { margin: 0; background: #000; color: #fff;
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+
+  /* The canvas is fixed behind everything and fills the viewport */
+  #scene { position: fixed; inset: 0; width: 100%; height: 100%; display: block; cursor: grab; }
+  #scene.grabbing { cursor: grabbing; }
+
+  /* Dark radial vignette on top of the canvas */
+  #vignette { position: fixed; inset: 0; pointer-events: none;
+    background: radial-gradient(circle, transparent 47%, rgba(0,0,0,.18) 72%, rgba(0,0,0,.78) 100%); }
+
+  /* Opening words */
+  #hero { position: fixed; inset: 0; display: flex; align-items: center;
+    justify-content: space-between; padding: 0 5vw; pointer-events: none;
+    font-size: clamp(44px, 8vw, 120px); font-weight: 500; letter-spacing: -0.03em; }
+
+  /* Paragraph shown between the two particle lines (fades in around stage 3) */
+  #info { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+    padding: 0 28px; box-sizing: border-box; pointer-events: none; opacity: 0; }
+  #info p { max-width: 34rem; margin: 0; text-align: center; text-wrap: pretty;
+    font-size: clamp(17px, 1.9vw, 24px); line-height: 1.65; color: rgba(255,255,255,.9); }
+
+  /* Empty tall element = the scroll distance for the 4 transitions */
+  #scroll { height: 700vh; }
+
+  /* Footer sits in normal flow at the very end of the page.
+     position + z-index lift it above the fixed canvas. */
+  #credit { position: relative; z-index: 2; text-align: center;
+    padding: 44px 20px 36px; font-size: .95rem; letter-spacing: .02em; color: rgba(255,255,255,.65); }
+</style>
+</head>
+<body>
+<canvas id="scene"></canvas>
+<div id="vignette"></div>
+<div id="hero"><span>Spiral</span><span>Galaxy</span></div>
+<div id="info"><p>This is an interactive particle scene built with three.js and WebGL. Every glowing point is one of tens of thousands of particles, moved on the GPU by a custom shader. As you scroll, the same particles travel from a spiral galaxy to a scattered cloud, then a triangle, and out to the edges of the screen. Move your cursor across them to drag them along and watch them settle back into place.</p></div>
+<div id="scroll"></div>
+<footer id="credit">Developed by Mustafa Ahmed Vahidy</footer>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+(() => {
+  const reduceMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  /* ---------- Renderer, scene, camera ---------- */
+  const canvas = document.getElementById('scene');
+  const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+  renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+  renderer.setClearColor(0x000000, 1);
+
+  const scene = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera(50, 1, 0.1, 100);
+  camera.position.set(0, 0, 5.5);
+
+  /* ---------- One shader material for galaxy and stars ----------
+     Every galaxy particle owns FIVE positions, one per stage:
+       0 galaxy    -> `position` (spun in the shader by uSpin)
+       1 cloud     -> aTarget1
+       2 triangle  -> aTarget2
+       3 two side lines -> aTarget3  = (side -1/+1, height -1..1, x jitter)
+       4 cat       -> aTarget4  = (x, depth, z) in "cat units"
+     uMorph 0..4 blends from one stage to the next on the GPU. */
+  const uniforms = {
+    uTime: { value: 0 }, uMorph: { value: 0 }, uPixelRatio: { value: renderer.getPixelRatio() },
+    uScale: { value: 40 }, uSpin: { value: 0 },
+    uSideX: { value: 4 },    // how far from centre the two lines sit
+    uSideH: { value: 2.6 },  // half the height of the lines
+    uCatS:  { value: 3.4 },  // size of the cat
+    uCatDz: { value: -0.2 }  // nudges the cat up so the footer has room
+  };
+
+  const material = new THREE.ShaderMaterial({
+    uniforms,
+    transparent: true,
+    depthWrite: false,
+    blending: THREE.AdditiveBlending,
+    vertexShader: `
+      attribute vec3 aTarget1;
+      attribute vec3 aTarget2;
+      attribute vec3 aTarget3;
+      attribute vec3 aTarget4;
+      attribute vec3 aColor;
+      attribute vec3 aOffset;     // cursor displacement, written from the CPU every frame
+      attribute float aSize;
+      attribute float aKeep;      // random 0..1: decides which particles stay visible in sparse shapes
+      attribute float aStar;      // 1 = background star (never morphs)
+      uniform float uTime, uMorph, uPixelRatio, uScale, uSpin, uSideX, uSideH, uCatS, uCatDz;
+      varying vec3 vColor;
+      varying float vTwinkle;
+      varying float vVis;
+      void main() {
+        vec3 p;
+        float vis = 1.0;
+        if (aStar > 0.5) {
+          p = position;
+        } else {
+          float m1 = smoothstep(0.0, 1.0, clamp(uMorph,       0.0, 1.0));
+          float m2 = smoothstep(0.0, 1.0, clamp(uMorph - 1.0, 0.0, 1.0));
+          float m3 = smoothstep(0.0, 1.0, clamp(uMorph - 2.0, 0.0, 1.0));
+          float m4 = smoothstep(0.0, 1.0, clamp(uMorph - 3.0, 0.0, 1.0));
+
+          // the galaxy, the triangle and the cat all turn by the same angle (uSpin);
+          // only the two side lines stay upright
+          float cs = cos(uSpin), sn = sin(uSpin);
+          vec3 g  = vec3(position.x * cs - position.z * sn, position.y, position.x * sn + position.z * cs);
+          vec3 t2 = vec3(aTarget2.x * cs - aTarget2.z * sn, aTarget2.y, aTarget2.x * sn + aTarget2.z * cs);
+          vec3 r4 = vec3(aTarget4.x * cs - aTarget4.z * sn, aTarget4.y, aTarget4.x * sn + aTarget4.z * cs);
+
+          // side lines: x from the screen edge, z from the height value, with a gentle wave
+          vec3 t3 = vec3(aTarget3.x * uSideX + aTarget3.z + sin(uTime * 0.8 + aTarget3.y * 4.0) * 0.04,
+                         0.0, -aTarget3.y * uSideH);
+          // cat: stored in cat units, scaled to the screen here
+          vec3 t4 = vec3(r4.x * uCatS, r4.y, r4.z * uCatS + uCatDz);
+
+          p = mix(g, aTarget1, m1);
+          p = mix(p, t2, m2);
+          p = mix(p, t3, m3);
+          p = mix(p, t4, m4);
+          p += aOffset;           // cursor push/pull, applied in every stage
+
+          // lines and cat use only a share of the particles so they look like
+          // glittering dots instead of a solid bar
+          vis = mix(1.0, step(aKeep, 0.24), m3);
+          vis = mix(vis, step(aKeep, 0.36), m4);
+        }
+        // tiny organic drift so the points never look frozen
+        p += 0.02 * vec3(sin(uTime * 0.5 + position.x * 3.0),
+                         cos(uTime * 0.4 + position.y * 3.0),
+                         sin(uTime * 0.3 + position.z * 3.0));
+        vec4 mv = modelViewMatrix * vec4(p, 1.0);
+        gl_PointSize = aSize * max(vis, 0.001) * uPixelRatio * (uScale / -mv.z);
+        gl_Position = projectionMatrix * mv;
+        vColor = aColor;
+        vVis = vis;
+        vTwinkle = 0.75 + 0.25 * sin(uTime * 2.0 + position.x * 50.0 + position.y * 30.0);
+      }`,
+    fragmentShader: `
+      varying vec3 vColor;
+      varying float vTwinkle;
+      varying float vVis;
+      void main() {
+        if (vVis < 0.02) discard;
+        float d = length(gl_PointCoord - 0.5);
+        if (d > 0.5) discard;
+        float glow = pow(1.0 - d * 2.0, 2.5);    // soft halo
+        float core = smoothstep(0.12, 0.0, d);   // hard bright centre
+        float a = clamp(glow * 0.8 + core, 0.0, 1.0) * vVis;
+        gl_FragColor = vec4(vColor * vTwinkle, a);
+      }`
+  });
+
+  function makePoints(d) {
+    const geo = new THREE.BufferGeometry();
+    const add = (name, arr, n) => geo.setAttribute(name, new THREE.BufferAttribute(arr, n));
+    add('position', d.pos, 3);
+    add('aTarget1', d.t1, 3); add('aTarget2', d.t2, 3);
+    add('aTarget3', d.t3, 3); add('aTarget4', d.t4, 3);
+    add('aColor', d.col, 3);  add('aSize', d.size, 1);  add('aKeep', d.keep, 1);
+    add('aStar', new Float32Array(d.size.length).fill(d.star ? 1 : 0), 1);
+    const offset = new THREE.BufferAttribute(new Float32Array(d.pos.length), 3);
+    offset.setUsage(THREE.DynamicDrawUsage);          // rewritten every frame
+    geo.setAttribute('aOffset', offset);
+    const pts = new THREE.Points(geo, material);
+    pts.frustumCulled = false;   // positions are moved in the shader, so skip CPU culling
+    return pts;
+  }
+
+  /* ---------- The cat: draw it on a hidden 2D canvas, then read its outline ---------- */
+  function makeCatSampler() {
+    const W = 400, H = 500;
+    const cv = document.createElement('canvas'); cv.width = W; cv.height = H;
+    const c = cv.getContext('2d', { willReadFrequently: true });
+    c.fillStyle = '#fff';
+    const ell = (x, y, rx, ry) => { c.beginPath(); c.ellipse(x, y, rx, ry, 0, 0, Math.PI * 2); c.fill(); };
+    const tri = (a, b, e) => { c.beginPath(); c.moveTo(...a); c.lineTo(...b); c.lineTo(...e); c.closePath(); c.fill(); };
+
+    ell(200, 392, 108, 88);                 // haunches
+    ell(200, 310, 70, 95);                  // chest
+    ell(200, 176, 80, 68);                  // head
+    tri([130, 146], [128, 60], [190, 106]); // left ear
+    tri([270, 146], [272, 60], [210, 106]); // right ear
+    ell(160, 462, 30, 18); ell(240, 462, 30, 18);   // front paws
+    const P0 = [298, 458], P1 = [420, 486], P2 = [374, 318];   // tail = curve with a tapering brush
+    for (let k = 0; k <= 60; k++) {
+      const t = k / 60, u = 1 - t, r = 14 - 6 * t;
+      ell(u * u * P0[0] + 2 * u * t * P1[0] + t * t * P2[0],
+          u * u * P0[1] + 2 * u * t * P1[1] + t * t * P2[1], r, r);
+    }
+
+    // turn the picture into lists of outline pixels and inside pixels
+    const px = c.getImageData(0, 0, W, H).data;
+    const mask = new Uint8Array(W * H);
+    for (let i = 0; i < W * H; i++) mask[i] = px[i * 4 + 3] > 128 ? 1 : 0;
+    const edge = [], inside = [];
+    let minX = W, maxX = 0, minY = H, maxY = 0;
+    for (let y = 1; y < H - 1; y++) for (let x = 1; x < W - 1; x++) {
+      const i = y * W + x;
+      if (!mask[i]) continue;
+      if (x < minX) minX = x; if (x > maxX) maxX = x;
+      if (y < minY) minY = y; if (y > maxY) maxY = y;
+      (mask[i - 1] && mask[i + 1] && mask[i - W] && mask[i + W] ? inside : edge).push(x, y);
+    }
+    const hgt = maxY - minY;
+    return { edge, inside, cx: (minX + maxX) / 2, cy: (minY + maxY) / 2, hgt, aspect: (maxX - minX) / hgt };
+  }
+  const cat = makeCatSampler();
+
+  /* ---------- Generate the particles ---------- */
+  const rnd = Math.random;
+  const gauss = () => (rnd() + rnd() + rnd() - 1.5) * 0.8;   // cheap bell curve, about -1..1
+
+  // More particles = richer shapes. Phones get fewer so they stay smooth.
+  const PARTICLES = innerWidth < 700 ? 18000 : 32000;
+
+  function buildGalaxy(N) {
+    // additive blending adds up, so each particle is dimmed a little as the count grows
+    const BRIGHT = Math.sqrt(14000 / N);
+    const pos = new Float32Array(N * 3), t1 = new Float32Array(N * 3), t2 = new Float32Array(N * 3);
+    const t3 = new Float32Array(N * 3), t4 = new Float32Array(N * 3);
+    const col = new Float32Array(N * 3), size = new Float32Array(N), keep = new Float32Array(N);
+    const R = 2.6, ARMS = 2, TURNS = 3.2;
+    const inner = new THREE.Color(1.0, 0.82, 0.6);              // warm core
+    const outer = new THREE.Color(0.45, 0.65, 1.0);             // blue rim
+    const spark = new THREE.Color(1.0, 0.5, 0.35);              // occasional orange star
+    const c = new THREE.Color();
+    const tri = [[0, -1.7], [-1.9, 1.4], [1.9, 1.4]];           // triangle corners (x, z)
+    const eyes = [[166, 172], [234, 172]];                      // cat eyes (pixels)
+
+    // one cat point, in cat units (cat height = 1, centred)
+    function catPoint() {
+      const r = rnd(); let x, y;
+      if (r < 0.84) { const e = Math.floor(rnd() * cat.edge.length / 2) * 2;      // outline
+        x = cat.edge[e] + gauss() * 1.6; y = cat.edge[e + 1] + gauss() * 1.6; }
+      else if (r < 0.89) { const e = eyes[rnd() < 0.5 ? 0 : 1];                   // glowing eyes
+        x = e[0] + gauss() * 7; y = e[1] + gauss() * 4; }
+      else if (r < 0.90) { x = 200 + gauss() * 4; y = 200 + gauss() * 3; }        // nose
+      else { const e = Math.floor(rnd() * cat.inside.length / 2) * 2;             // faint body dust
+        x = cat.inside[e]; y = cat.inside[e + 1]; }
+      return [(x - cat.cx) / cat.hgt, (y - cat.cy) / cat.hgt];
+    }
+
+    for (let i = 0; i < N; i++) {
+      // stage 0: spiral galaxy
+      let x, y, z, r;
+      if (rnd() < 0.22) {                                       // bulge
+        r = Math.abs(gauss()) * 0.45;
+        const a = rnd() * Math.PI * 2;
+        x = Math.cos(a) * r; z = Math.sin(a) * r; y = gauss() * 0.12;
+      } else {                                                  // arms
+        r = 0.15 + Math.pow(rnd(), 0.75) * R;
+        const a = (i % ARMS) * (Math.PI * 2 / ARMS) + Math.pow(r / R, 0.7) * Math.PI * TURNS;
+        const s = 0.03 + 0.09 * (r / R);
+        x = Math.cos(a) * r + gauss() * s;
+        z = Math.sin(a) * r + gauss() * s;
+        y = gauss() * 0.05 * (1 - r / R);
+      }
+      pos.set([x, y, z], i * 3);
+
+      // stage 1: scattered cloud
+      const u = rnd() * 2 - 1, th = rnd() * Math.PI * 2, rr = Math.cbrt(rnd()) * 3.2;
+      const sq = Math.sqrt(1 - u * u);
+      t1.set([rr * sq * Math.cos(th), rr * u * 0.7, rr * sq * Math.sin(th)], i * 3);
+
+      // stage 2: triangle outline
+      const e = Math.floor(rnd() * 3), t = rnd();
+      const A = tri[e], B = tri[(e + 1) % 3];
+      t2.set([A[0] + (B[0] - A[0]) * t + gauss() * 0.04, gauss() * 0.04,
+              A[1] + (B[1] - A[1]) * t + gauss() * 0.04], i * 3);
+
+      // stage 3: left or right line (mostly tight, a few drifting wider)
+      t3.set([i % 2 ? 1 : -1, rnd() * 2 - 1, gauss() * (rnd() < 0.85 ? 0.05 : 0.22)], i * 3);
+
+      // stage 4: cat
+      const cp = catPoint();
+      t4.set([cp[0], gauss() * 0.02, cp[1]], i * 3);
+
+      c.copy(inner).lerp(outer, Math.min(1, (r / R) * 1.3));
+      if (rnd() < 0.12) c.copy(spark);
+      c.multiplyScalar((0.6 + rnd() * 0.6) * BRIGHT);
+      col.set([c.r, c.g, c.b], i * 3);
+
+      size[i] = rnd() < 0.04 ? 0.9 + rnd() * 1.0 : 0.12 + rnd() * 0.3;
+      keep[i] = rnd();
+    }
+    return { pos, t1, t2, t3, t4, col, size, keep };
+  }
+
+  function buildStars(N) {
+    const pos = new Float32Array(N * 3), col = new Float32Array(N * 3);
+    const size = new Float32Array(N), keep = new Float32Array(N).fill(1);
+    for (let i = 0; i < N; i++) {
+      const u = rnd() * 2 - 1, th = rnd() * Math.PI * 2, rr = 12 + rnd() * 18, sq = Math.sqrt(1 - u * u);
+      pos.set([rr * sq * Math.cos(th), rr * u, rr * sq * Math.sin(th)], i * 3);
+      const b = 0.25 + rnd() * 0.6;
+      col.set([b * 0.85, b * 0.9, b], i * 3);
+      size[i] = 0.4 + rnd() * 1.0;
+    }
+    return { pos, t1: pos, t2: pos, t3: pos, t4: pos, col, size, keep, star: true };
+  }
+
+  // tilt group = camera angle on the shapes
+  const BASE_TILT = Math.PI / 2 - 0.35;               // PI/2 would be perfectly face-on
+  const tilt = new THREE.Group();
+  const galaxy = makePoints(buildGalaxy(PARTICLES));
+  tilt.add(galaxy);
+  tilt.rotation.x = BASE_TILT;
+  scene.add(tilt);
+
+  const stars = makePoints(buildStars(1800));
+  scene.add(stars);
+
+  /* ---------- Mouse parallax + particles dragged by the cursor ---------- */
+  let mx = 0, my = 0, smx = 0, smy = 0;
+  const ndc = new THREE.Vector2();
+  let pointerIn = false, pressed = false, havePrev = false;
+  let ptX = 0, ptZ = 0, ptVX = 0, ptVZ = 0;          // cursor position/velocity in shape space
+
+  addEventListener('pointermove', e => {
+    mx = e.clientX / innerWidth * 2 - 1;
+    my = e.clientY / innerHeight * 2 - 1;
+    ndc.set(mx, -my);
+    pointerIn = true;
+  });
+  document.documentElement.addEventListener('mouseleave', () => { pointerIn = false; havePrev = false; });
+  addEventListener('pointerdown', () => { pressed = true; canvas.classList.add('grabbing'); });
+  addEventListener('pointerup', e => {
+    pressed = false; canvas.classList.remove('grabbing');
+    if (e.pointerType === 'touch') { pointerIn = false; havePrev = false; }
+  });
+
+  // Each particle keeps an offset (how far it has been pushed from where it should be) and a velocity.
+  const offAttr = galaxy.geometry.attributes.aOffset;
+  const off = offAttr.array;
+  const home = galaxy.geometry.attributes.position.array;
+  const tgt1 = galaxy.geometry.attributes.aTarget1.array;
+  const tgt2 = galaxy.geometry.attributes.aTarget2.array;
+  const tgt3 = galaxy.geometry.attributes.aTarget3.array;
+  const tgt4 = galaxy.geometry.attributes.aTarget4.array;
+  const vel = new Float32Array(off.length);
+  const COUNT = home.length / 3;
+  const smooth01 = x => { x = Math.min(1, Math.max(0, x)); return x * x * (3 - 2 * x); };
+
+  const raycaster = new THREE.Raycaster();
+  const plane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);   // the shapes' flat plane
+  const invMat = new THREE.Matrix4(), ray = new THREE.Ray(), hit = new THREE.Vector3();
+
+  function updateInteraction(dt) {
+    // Same blend the shader uses, so we know where each particle is *right now*.
+    const m1 = smooth01(morph), m2 = smooth01(morph - 1), m3 = smooth01(morph - 2), m4 = smooth01(morph - 3);
+    const cs = Math.cos(uniforms.uSpin.value), sn = Math.sin(uniforms.uSpin.value);
+    const sideX = uniforms.uSideX.value, sideH = uniforms.uSideH.value;
+    const catS = uniforms.uCatS.value, catDz = uniforms.uCatDz.value;
+
+    // 1. Where is the cursor on the plane, and how fast is it moving?
+    let active = false;
+    if (pointerIn) {
+      raycaster.setFromCamera(ndc, camera);
+      galaxy.updateWorldMatrix(true, false);
+      invMat.copy(galaxy.matrixWorld).invert();
+      ray.copy(raycaster.ray).applyMatrix4(invMat);
+      if (ray.intersectPlane(plane, hit)) {
+        if (havePrev && dt > 0) {
+          ptVX += ((hit.x - ptX) / dt - ptVX) * 0.3;
+          ptVZ += ((hit.z - ptZ) / dt - ptVZ) * 0.3;
+          const sp = Math.hypot(ptVX, ptVZ);
+          if (sp > 8) { ptVX *= 8 / sp; ptVZ *= 8 / sp; }
+        }
+        ptX = hit.x; ptZ = hit.z; havePrev = true; active = true;
+      }
+    } else { ptVX *= 0.9; ptVZ *= 0.9; }
+
+    // 2. Move every particle: drag with the cursor, then spring back.
+    const R = pressed ? 0.45 : 0.28;                 // reach of the cursor (smaller = tighter area)
+    const inv2R = 1 / (2 * R * R);
+    const dragGain = pressed ? 16 : 12;
+    const SPRING = 1.3, DAMP = Math.exp(-1.6 * dt);  // lower SPRING = slower, floatier return
+    for (let i = 0; i < COUNT; i++) {
+      const k = i * 3;
+      let vx = vel[k], vy = vel[k + 1], vz = vel[k + 2];
+      const ox = off[k], oy = off[k + 1], oz = off[k + 2];
+
+      if (active) {
+        // current position of this particle = the stage blend (x and z only)
+        let bx = home[k] * cs - home[k + 2] * sn, bz = home[k] * sn + home[k + 2] * cs;
+        bx += (tgt1[k] - bx) * m1;                                  bz += (tgt1[k + 2] - bz) * m1;
+        // triangle and cat are rotated by the same spin as the galaxy
+        bx += (tgt2[k] * cs - tgt2[k + 2] * sn - bx) * m2;          bz += (tgt2[k] * sn + tgt2[k + 2] * cs - bz) * m2;
+        bx += (tgt3[k] * sideX + tgt3[k + 2] - bx) * m3;            bz += (-tgt3[k + 1] * sideH - bz) * m3;
+        bx += ((tgt4[k] * cs - tgt4[k + 2] * sn) * catS - bx) * m4;
+        bz += ((tgt4[k] * sn + tgt4[k + 2] * cs) * catS + catDz - bz) * m4;
+
+        const dx = bx + ox - ptX, dz = bz + oz - ptZ;
+        const w = Math.exp(-(dx * dx + dz * dz) * inv2R);           // 1 under the cursor, 0 far away
+        if (w > 0.002) {
+          const f = Math.min(1, w * dragGain * dt);
+          vx += (ptVX - vx) * f;                     // take on the cursor's velocity (the "drag")
+          vz += (ptVZ - vz) * f;
+          vx -= dx * w * 2.0 * dt;                   // a gentle pull toward the cursor
+          vz -= dz * w * 2.0 * dt;
+        }
+      }
+
+      vx -= ox * SPRING * dt; vy -= oy * SPRING * dt; vz -= oz * SPRING * dt;  // spring back
+      vx *= DAMP; vy *= DAMP; vz *= DAMP;
+      vel[k] = vx; vel[k + 1] = vy; vel[k + 2] = vz;
+      off[k] = ox + vx * dt; off[k + 1] = oy + vy * dt; off[k + 2] = oz + vz * dt;
+    }
+    offAttr.needsUpdate = true;
+  }
+
+  /* ---------- Scroll drives the morph (0 galaxy, 1 cloud, 2 triangle, 3 lines, 4 cat) ---------- */
+  const hero = document.getElementById('hero');
+  const info = document.getElementById('info');
+  const credit = document.getElementById('credit');
+  let morphTarget = 0, morph = 0;
+  function readScroll() {
+    const max = document.documentElement.scrollHeight - innerHeight;
+    const range = max - credit.offsetHeight;           // the footer scrolls in after the cat has formed
+    morphTarget = range > 0 ? Math.min(1, Math.max(0, scrollY / range)) * 4 : 0;
+  }
+  addEventListener('scroll', readScroll, { passive: true });
+
+  function resize() {
+    renderer.setSize(innerWidth, innerHeight, false);
+    camera.aspect = innerWidth / innerHeight;
+    camera.updateProjectionMatrix();
+    uniforms.uScale.value = innerHeight * 0.045;       // keeps particle size consistent on any screen
+
+    // size of the visible area at the shapes' distance, so lines and cat fit any screen
+    const halfH = camera.position.z * Math.tan(THREE.MathUtils.degToRad(camera.fov / 2));
+    const halfW = halfH * camera.aspect;
+    uniforms.uSideX.value = halfW * 0.92;
+    uniforms.uSideH.value = halfH * 1.02;
+    uniforms.uCatS.value  = Math.min(halfH * 2 * 0.6, halfW * 2 * 0.7 / cat.aspect);   // a bit smaller: it turns, so it needs room
+    uniforms.uCatDz.value = -halfH * 0.08;
+    readScroll();
+  }
+  addEventListener('resize', resize);
+  resize();
+
+  /* ---------- Animation loop ---------- */
+  const clock = new THREE.Clock();
+  function frame() {
+    const dt = Math.min(clock.getDelta(), 0.05);
+
+    if (!reduceMotion) {
+      uniforms.uTime.value += dt;
+      uniforms.uSpin.value -= dt * 0.06;               // galaxy spin
+      stars.rotation.y += dt * 0.004;
+    }
+
+    morph += (morphTarget - morph) * Math.min(1, dt * 3);   // ease toward the scroll position
+    uniforms.uMorph.value = morph;
+
+    // tilt: the triangle keeps its slight angle, then everything turns face-on for the lines and cat
+    const flat = smooth01(morph - 2);
+    const par = 1 - 0.8 * flat;                        // less mouse parallax once the shapes are flat
+    smx += (mx - smx) * 0.05;
+    smy += (my - smy) * 0.05;
+    tilt.rotation.x = BASE_TILT + (Math.PI / 2 - BASE_TILT) * flat + smy * 0.15 * par;
+    tilt.rotation.z = smx * 0.15 * par;
+
+    updateInteraction(dt);
+
+    hero.style.opacity = Math.max(0, 1 - morph * 2.5);
+    info.style.opacity = Math.min(1, Math.max(0, 1.6 - Math.abs(morph - 3) * 3));   // visible around stage 3
+
+    renderer.render(scene, camera);
+    requestAnimationFrame(frame);
+  }
+  frame();
+})();
+</script>
+</body>
+</html>
